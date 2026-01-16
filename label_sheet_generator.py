@@ -179,6 +179,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         self.run_stats = {}
         self.customer_refs = {}
         self.part_info_map = {}
+        self.all_part_counts = {}  # Store unfiltered counts for distribution report
         # Thread-local storage for QR API sessions
         self._thread_local = threading.local()
     
@@ -641,12 +642,18 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         return url_paths
     
-    def _count_and_filter_parts(self, url_paths: List[str]) -> Dict[str, int]:
-        """Count occurrences and filter for min_order_count+ occurrences."""
-        part_counts = Counter(url_paths)
-        frequent_parts = {url_path: count for url_path, count in part_counts.items() if count >= self.min_order_count}
-        self._log(f"Found {len(frequent_parts)} parts ordered {self.min_order_count}+ times")
-        return frequent_parts
+    def _count_and_filter_parts(self, url_paths: List[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Count occurrences and filter for min_order_count+ occurrences.
+        
+        Returns:
+            Tuple of (filtered_parts, all_parts) where:
+            - filtered_parts: dict of parts with min_order_count+ occurrences
+            - all_parts: dict of ALL parts with their counts (unfiltered)
+        """
+        all_part_counts = dict(Counter(url_paths))
+        frequent_parts = {url_path: count for url_path, count in all_part_counts.items() if count >= self.min_order_count}
+        self._log(f"Found {len(frequent_parts)} parts ordered {self.min_order_count}+ times (out of {len(all_part_counts)} unique parts)")
+        return frequent_parts, all_part_counts
     
     def _click_connect_to_sales_workstation(self) -> bool:
         """Click the 'Connect to Sales Workstation' button."""
@@ -798,8 +805,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             self._log(f"Error during order analysis for account {account_number}: {e}", "ERROR")
             return []
     
-    def _analyze_customer_orders(self, account_numbers: List[str]) -> Tuple[List[Tuple[str, int]], List[str], List[str]]:
-        """Analyze order history for multiple customer accounts."""
+    def _analyze_customer_orders(self, account_numbers: List[str]) -> Tuple[List[Tuple[str, int]], Dict[str, int], List[str], List[str]]:
+        """Analyze order history for multiple customer accounts.
+        
+        Returns:
+            Tuple of (frequent_parts_list, all_part_counts, successful_accounts, failed_accounts)
+        """
         self._log("="*80)
         self._log("PHASE 1: ANALYZING CUSTOMER ORDER HISTORY")
         self._log(f"Accounts to process: {', '.join(account_numbers)}")
@@ -807,7 +818,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         if not self._setup_sales_workstation_and_order_history():
             self._log("Failed to set up Sales Workstation - cannot continue", "ERROR")
-            return [], [], account_numbers
+            return [], {}, [], account_numbers
         
         all_url_paths = []
         successful_accounts = []
@@ -836,12 +847,15 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         if not all_url_paths:
             self._log("No parts extracted from any account", "ERROR")
-            return [], successful_accounts, failed_accounts
+            return [], {}, successful_accounts, failed_accounts
         
-        frequent_parts = self._count_and_filter_parts(all_url_paths)
+        frequent_parts, all_part_counts = self._count_and_filter_parts(all_url_paths)
         sorted_parts = sorted(frequent_parts.items(), key=lambda x: x[1], reverse=True)
         
-        return sorted_parts, successful_accounts, failed_accounts
+        # Store all part counts for distribution report
+        self.all_part_counts = all_part_counts
+        
+        return sorted_parts, all_part_counts, successful_accounts, failed_accounts
     
     # ==================== PART SCRAPING METHODS (SELENIUM - SEQUENTIAL) ====================
     
@@ -1327,12 +1341,68 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             
         return result
     
-    # ==================== CSV EXPORT METHODS ====================
+    # ==================== CSV/EXCEL EXPORT METHODS ====================
+    
+    def _generate_order_distribution_excel(self, all_part_counts: Dict[str, int], 
+                                            output_folder: Path, account_numbers: List[str]) -> str:
+        """Generate Excel file with order distribution statistics and part list.
+        
+        Sheet 1: Distribution summary (unique parts count, parts ordered N+ times)
+        Sheet 2: Alphabetical list of all parts with order counts
+        """
+        excel_filename = "order_distribution.xlsx"
+        excel_path = output_folder / excel_filename
+        
+        self._log(f"Generating order distribution Excel: {excel_path}")
+        
+        total_unique = len(all_part_counts)
+        
+        # Calculate distribution stats (2+ through 10+)
+        distribution_data = []
+        distribution_data.append({
+            'Metric': 'Total Unique Parts Ordered',
+            'Count': total_unique
+        })
+        
+        for threshold in range(2, 11):
+            count_at_threshold = sum(1 for c in all_part_counts.values() if c >= threshold)
+            distribution_data.append({
+                'Metric': f'Parts Ordered {threshold}+ Times',
+                'Count': count_at_threshold
+            })
+        
+        df_distribution = pd.DataFrame(distribution_data)
+        
+        # Build alphabetical part list with display_part for sorting
+        part_list_data = []
+        for url_path, count in all_part_counts.items():
+            part_info = self.part_info_map.get(url_path, {
+                'display_part': url_path,
+                'base_part': url_path,
+                'url_path': url_path,
+                'is_component': False
+            })
+            part_list_data.append({
+                'Part Number': part_info['display_part'],
+                'Order Count': count
+            })
+        
+        # Sort alphabetically by part number
+        part_list_data.sort(key=lambda x: x['Part Number'])
+        df_part_list = pd.DataFrame(part_list_data)
+        
+        # Write to Excel with two sheets
+        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+            df_distribution.to_excel(writer, sheet_name='Distribution Summary', index=False)
+            df_part_list.to_excel(writer, sheet_name='Part List', index=False)
+        
+        self._log(f"Order distribution Excel generated with {total_unique} unique parts")
+        return str(excel_path)
     
     def _generate_parts_csv(self, frequent_parts: List[Tuple[str, int]], scraped_data_cache: Dict,
                             output_folder: Path, account_numbers: List[str]) -> str:
         """Generate CSV file with all parts and their information."""
-        csv_filename = "order_history_scrape_parts_list.csv"
+        csv_filename = "scrape_info_sheet.csv"
         csv_path = output_folder / csv_filename
         
         self._log(f"Generating parts CSV: {csv_path}")
@@ -1656,6 +1726,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         self.failed_parts = []
         self.customer_refs = {}
         self.part_info_map = {}
+        self.all_part_counts = {}
         
         try:
             if use_excel_mode:
@@ -1665,6 +1736,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 
                 part_numbers = self._read_part_numbers_from_excel(excel_file_path)
                 frequent_parts = [(part, 1) for part in part_numbers]
+                all_part_counts = {part: 1 for part in part_numbers}
                 successful_accounts = []
                 failed_accounts = []
                 
@@ -1691,7 +1763,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 self.driver = self._create_webdriver(headless=False)
                 
                 try:
-                    frequent_parts, successful_accounts, failed_accounts = self._analyze_customer_orders(account_numbers)
+                    frequent_parts, all_part_counts, successful_accounts, failed_accounts = self._analyze_customer_orders(account_numbers)
                 finally:
                     if self.driver:
                         self.driver.quit()
@@ -1717,6 +1789,18 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                     "message": "No parts to process",
                     "data": {"frequent_parts_count": 0}
                 }
+            
+            # Generate order distribution Excel right after scraping (account mode only)
+            order_distribution_path = None
+            if not use_excel_mode and all_part_counts:
+                try:
+                    order_distribution_path = self._generate_order_distribution_excel(
+                        all_part_counts,
+                        output_folder,
+                        account_numbers
+                    )
+                except Exception as e:
+                    self._log(f"Error generating order distribution Excel: {e}", "ERROR")
             
             label_data = self._generate_labels_for_parts(frequent_parts, output_folder, sizes_to_generate)
             
@@ -1759,7 +1843,9 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 result_data["cutoff_date"] = self.cutoff_date.strftime('%Y-%m-%d')
                 result_data["min_order_count"] = self.min_order_count
                 result_data["input_mode"] = "account"
-                result_data["csv_file_path"] = csv_path
+                result_data["scrape_info_sheet_path"] = csv_path
+                result_data["order_distribution_path"] = order_distribution_path
+                result_data["total_unique_parts"] = len(all_part_counts)
             
             total_in_pdf = sum(r["labels_in_pdf"] for r in label_data["size_results"].values())
             total_excluded = sum(r["labels_excluded"] for r in label_data["size_results"].values())
@@ -1805,10 +1891,15 @@ def print_results(result: Dict):
         
         print(f"Lookback Period: {data.get('lookback_days')} days (from {data.get('cutoff_date')})")
         print(f"Minimum Order Count: {data.get('min_order_count', 2)}+")
+        print(f"Total Unique Parts: {data.get('total_unique_parts', 'N/A')}")
         
-        csv_path = data.get('csv_file_path')
+        order_dist_path = data.get('order_distribution_path')
+        if order_dist_path:
+            print(f"Order Distribution Excel: {order_dist_path}")
+        
+        csv_path = data.get('scrape_info_sheet_path')
         if csv_path:
-            print(f"Parts List CSV: {csv_path}")
+            print(f"Scrape Info Sheet CSV: {csv_path}")
     else:
         print(f"Excel File: {data.get('excel_file_path')}")
         customer_refs_count = data.get('customer_refs_count', 0)
@@ -1854,7 +1945,7 @@ if __name__ == "__main__":
         "account_number": "115328800",
         "lookback_days": 380,
         "min_order_count": 2,
-        "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\Test Outputs\Scrape 6",
+        "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\Test Outputs\Scrape 7",
         "label_size": "medium"  
     }
     
