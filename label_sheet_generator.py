@@ -24,6 +24,8 @@ import io
 import pandas as pd
 import openpyxl
 import pymupdf
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Handle stdout encoding
 try:
@@ -38,6 +40,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PAGE_LOAD_TIMEOUT = 60
 IMPLICIT_WAIT = 10
 CHROMEDRIVER_PATH = r'\\int\mcm\SoftwareLibrary\Chrome Drivers\chromedriver.exe'
+
+# Threading Configuration
+MAX_THREADS_LABELS = 10  # For label generation (QR codes + image processing)
 
 # Embedded SVG with inline styles (PyMuPDF doesn't handle CSS classes)
 MCMASTER_LOGO_SVG = '''<?xml version="1.0" encoding="utf-8"?>
@@ -120,6 +125,10 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
     """
     Combined tool that analyzes customer order history to find frequently ordered parts
     and automatically generates labels for those parts.
+    
+    Uses hybrid approach:
+    - Sequential Selenium scraping (reliable, avoids WAF)
+    - Threaded label generation (fast QR codes + image processing)
     """
     
     name = "customer_parts_analyzer_and_label_generator"
@@ -128,7 +137,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
     param_spec = {
         "account_number": {
             "type": "string",
-            "description": "Customer account number(s) to analyze. Can be a single account or comma-separated list (e.g., '382952000' or '382952000,123456000,789012000'). Use this OR excel_file_path, not both.",
+            "description": "Customer account number(s) to analyze. Can be a single account or comma-separated list.",
             "required": False
         },
         "lookback_days": {
@@ -143,7 +152,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         },
         "excel_file_path": {
             "type": "string",
-            "description": "Path to Excel file containing part numbers in column A and optional customer references in column B (no header). Use this OR account_number, not both.",
+            "description": "Path to Excel file containing part numbers in column A and optional customer references in column B.",
             "required": False
         },
         "output_folder": {
@@ -169,9 +178,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         self.hit_date_cutoff = False
         self.run_stats = {}
         self.customer_refs = {}
+        self.part_info_map = {}
+        # Thread-local storage for QR API sessions
+        self._thread_local = threading.local()
     
     def _log(self, message: str, level: str = "INFO"):
-        """Simple logging"""
+        """Thread-safe logging"""
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{timestamp}] [{level}] {message}")
     
@@ -185,12 +197,19 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             "orders_no_date": 0,
             "orders_date_parse_fail": 0,
             "total_parts_extracted": 0,
+            "component_parts_found": 0,
             "scroll_count": 0,
             "final_scroll_height": 0,
             "final_tile_count": 0,
             "page_reload_attempts": self.run_stats.get("page_reload_attempts", 0),
         }
         self.hit_date_cutoff = False
+    
+    def _get_thread_session(self) -> requests.Session:
+        """Get or create a requests session for the current thread (for QR API calls)."""
+        if not hasattr(self._thread_local, 'session'):
+            self._thread_local.session = requests.Session()
+        return self._thread_local.session
     
     # ==================== EXCEL INPUT METHODS ====================
     
@@ -255,6 +274,14 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             if not unique_parts:
                 raise ValueError("No valid part numbers found in Excel file")
             
+            for part in unique_parts:
+                self.part_info_map[part] = {
+                    'display_part': part,
+                    'base_part': part,
+                    'url_path': part,
+                    'is_component': False
+                }
+            
             return unique_parts
             
         except Exception as e:
@@ -276,7 +303,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             img = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
             doc.close()
             self.mcmaster_logo = img
-            self._log("Successfully loaded McMaster logo from embedded SVG")
             return img
         except Exception as e:
             self._log(f"Could not load SVG logo: {e}", "ERROR")
@@ -348,7 +374,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             window = app.top_window()
             window.set_focus()
             
-            # Press ESC to clear the screen before entering new account
             window.type_keys("{ESC}")
             time.sleep(0.2)
             window.type_keys("{ESC}")
@@ -432,7 +457,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         return None
     
     def _get_scrollable_element(self):
-        """Find and return the scrollable element. Returns None if not found."""
+        """Find and return the scrollable element."""
         try:
             return self.driver.find_element(By.ID, "ActivitySummary")
         except:
@@ -470,7 +495,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             return None
     
     def _scroll_to_load_all_content(self, max_scrolls: int = 100) -> None:
-        """Scroll to load all order history content with improved reliability."""
+        """Scroll to load all order history content."""
         self._log(f"Scrolling to load content (cutoff: {self.cutoff_date.strftime('%Y-%m-%d')})...")
         self.hit_date_cutoff = False
         
@@ -493,10 +518,8 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                         scrollable_element
                     )
                 except:
-                    self._log("Scrollable element went stale, re-finding...", "DEBUG")
                     scrollable_element = self._get_scrollable_element()
                     if not scrollable_element:
-                        self._log("Could not re-find scrollable container", "ERROR")
                         break
                     continue
                 
@@ -516,8 +539,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                         break
                 
                 if new_tile_count == last_tile_count:
-                    self._log(f"Scroll {scroll_count}: No new tiles, attempting nudge...", "DEBUG")
-                    
                     try:
                         self.driver.execute_script("arguments[0].scrollTop = 0", scrollable_element)
                         time.sleep(0.3)
@@ -527,7 +548,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                         )
                         time.sleep(0.3)
                     except:
-                        self._log("Element went stale during nudge", "DEBUG")
                         break
                     
                     new_tile_count = self._count_order_tiles()
@@ -535,15 +555,8 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                     if new_tile_count == last_tile_count:
                         oldest_date = self._check_oldest_date_on_page()
                         if oldest_date and oldest_date < self.cutoff_date:
-                            self._log(f"Scroll {scroll_count}: Hit date cutoff (oldest: {oldest_date.strftime('%Y-%m-%d')})")
                             self.hit_date_cutoff = True
-                        else:
-                            self._log(f"Scroll {scroll_count}: Nudge failed, scrolling stopped")
                         break
-                    else:
-                        self._log(f"Scroll {scroll_count}: Nudge worked! {last_tile_count} -> {new_tile_count} tiles (+{new_tile_count - last_tile_count})")
-                else:
-                    self._log(f"Scroll {scroll_count}: {last_tile_count} -> {new_tile_count} tiles (+{new_tile_count - last_tile_count})", "DEBUG")
                 
                 last_tile_count = new_tile_count
             
@@ -556,7 +569,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             self.run_stats["scroll_count"] = scroll_count
             self.run_stats["final_scroll_height"] = final_height
             self.run_stats["final_tile_count"] = final_tile_count
-            self._log(f"Scrolling complete (scrolls: {scroll_count}, tiles: {final_tile_count}, hit_cutoff: {self.hit_date_cutoff})")
             
         except Exception as e:
             self._log(f"Error during scrolling: {e}", "ERROR")
@@ -564,7 +576,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
     def _extract_part_numbers_from_order_history(self) -> List[str]:
         """Extract part numbers from the loaded order history."""
         self._log("Extracting part numbers from DOM...")
-        part_numbers = []
+        url_paths = []
         
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -597,21 +609,42 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 part_elements = order_tile.find_all(attrs={'data-mcm-partnumber': True})
                 
                 for element in part_elements:
-                    part_number = element.get('data-mcm-partnumber', '').strip().upper()
-                    if part_number:
-                        part_numbers.append(part_number)
+                    base_part = element.get('data-mcm-partnumber', '').strip().upper()
+                    comp_part_raw = element.get('data-mcm-comppartnumber', '')
+                    comp_part = comp_part_raw.strip().upper() if comp_part_raw else None
+                    
+                    if base_part:
+                        if comp_part:
+                            url_path = f"{base_part}-{comp_part}"
+                            display_part = comp_part
+                            is_component = True
+                            self.run_stats["component_parts_found"] = self.run_stats.get("component_parts_found", 0) + 1
+                        else:
+                            url_path = base_part
+                            display_part = base_part
+                            is_component = False
+                        
+                        url_paths.append(url_path)
+                        
+                        if url_path not in self.part_info_map:
+                            self.part_info_map[url_path] = {
+                                'display_part': display_part,
+                                'base_part': base_part,
+                                'url_path': url_path,
+                                'is_component': is_component
+                            }
             
-            self.run_stats["total_parts_extracted"] = len(part_numbers)
+            self.run_stats["total_parts_extracted"] = len(url_paths)
             
         except Exception as e:
             self._log(f"Error extracting parts: {e}", "ERROR")
         
-        return part_numbers
+        return url_paths
     
-    def _count_and_filter_parts(self, part_numbers: List[str]) -> Dict[str, int]:
-        """Count occurrences of each part number and filter for min_order_count+ occurrences."""
-        part_counts = Counter(part_numbers)
-        frequent_parts = {part: count for part, count in part_counts.items() if count >= self.min_order_count}
+    def _count_and_filter_parts(self, url_paths: List[str]) -> Dict[str, int]:
+        """Count occurrences and filter for min_order_count+ occurrences."""
+        part_counts = Counter(url_paths)
+        frequent_parts = {url_path: count for url_path, count in part_counts.items() if count >= self.min_order_count}
         self._log(f"Found {len(frequent_parts)} parts ordered {self.min_order_count}+ times")
         return frequent_parts
     
@@ -655,10 +688,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             return False
     
     def _setup_sales_workstation_and_order_history(self) -> bool:
-        """
-        One-time setup: Open Sales Workstation and Order History, click connect button.
-        Returns True if successful, False otherwise.
-        """
+        """One-time setup: Open Sales Workstation and Order History."""
         try:
             self._log("Opening Sales Workstation...")
             self.driver.get("https://salesworkstation/")
@@ -672,12 +702,10 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             self.driver.execute_script("window.open('https://www.mcmaster.com/order-history/', '_blank');")
             time.sleep(0.5)
             
-            # Switch to order history tab
             order_history_tab = self.driver.window_handles[-1]
             self.driver.switch_to.window(order_history_tab)
             time.sleep(1)
             
-            # Try to click connect button
             self._log("Attempting to connect to Sales Workstation...")
             if self._click_connect_to_sales_workstation():
                 self._log("Successfully clicked connect button")
@@ -692,25 +720,19 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             return False
     
     def _analyze_single_account_orders(self, account_number: str) -> List[str]:
-        """
-        Analyze a single customer account's order history. 
-        Assumes Sales Workstation and Order History are already open.
-        Returns list of part numbers.
-        """
+        """Analyze a single customer account's order history."""
         self._log(f"Processing account: {account_number}")
         
         self.run_stats = {"page_reload_attempts": 0}
         
         try:
-            # Navigate mainframe to this account
             self._navigate_mainframe_icma(account_number)
             
-            # Switch back to order history tab (should be the last window)
             order_history_tab = self.driver.window_handles[-1]
             self.driver.switch_to.window(order_history_tab)
             time.sleep(0.5)
             
-            part_numbers = []
+            url_paths = []
             max_page_attempts = MAX_ORDER_HISTORY_ATTEMPTS
             
             for attempt in range(1, max_page_attempts + 1):
@@ -736,7 +758,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 time.sleep(1)
                 
                 initial_tile_count = self._count_order_tiles()
-                self._log(f"Initial tile count: {initial_tile_count}")
                 
                 if initial_tile_count == 0:
                     self._log(f"Order history empty, retrying...", "WARN")
@@ -751,7 +772,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 )
                 
                 self._scroll_to_load_all_content()
-                part_numbers = self._extract_part_numbers_from_order_history()
+                url_paths = self._extract_part_numbers_from_order_history()
                 
                 if self.hit_date_cutoff:
                     self._log(f"Successfully hit date cutoff - data is complete")
@@ -764,36 +785,31 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                         time.sleep(1)
                         continue
                     else:
-                        self._log(f"Exhausted retries, returning what we have", "WARN")
                         break
             
-            if part_numbers:
-                self._log(f"Account {account_number}: {len(part_numbers)} parts extracted")
+            if url_paths:
+                self._log(f"Account {account_number}: {len(url_paths)} parts extracted")
             else:
                 self._log(f"Account {account_number}: No parts extracted", "WARN")
             
-            return part_numbers
+            return url_paths
             
         except Exception as e:
             self._log(f"Error during order analysis for account {account_number}: {e}", "ERROR")
             return []
     
     def _analyze_customer_orders(self, account_numbers: List[str]) -> Tuple[List[Tuple[str, int]], List[str], List[str]]:
-        """
-        Analyze order history for multiple customer accounts.
-        Returns: (frequent_parts, successful_accounts, failed_accounts)
-        """
+        """Analyze order history for multiple customer accounts."""
         self._log("="*80)
         self._log("PHASE 1: ANALYZING CUSTOMER ORDER HISTORY")
         self._log(f"Accounts to process: {', '.join(account_numbers)}")
         self._log("="*80)
         
-        # One-time setup: Open Sales Workstation and Order History
         if not self._setup_sales_workstation_and_order_history():
             self._log("Failed to set up Sales Workstation - cannot continue", "ERROR")
-            return [], [], account_numbers  # All accounts failed
+            return [], [], account_numbers
         
-        all_part_numbers = []
+        all_url_paths = []
         successful_accounts = []
         failed_accounts = []
         previous_parts_set = None
@@ -801,77 +817,91 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         for account_number in account_numbers:
             self._log(f"\n--- Processing account {account_number} ---")
             try:
-                part_numbers = self._analyze_single_account_orders(account_number)
+                url_paths = self._analyze_single_account_orders(account_number)
                 
-                if part_numbers:
-                    # Debug check: compare with previous account to detect if we failed to switch accounts
-                    current_parts_set = set(part_numbers)
+                if url_paths:
+                    current_parts_set = set(url_paths)
                     if previous_parts_set is not None and current_parts_set == previous_parts_set:
                         self._log(f"WARNING: Account {account_number} returned identical parts to previous account!", "WARN")
-                        self._log(f"This may indicate mainframe did not switch accounts properly", "WARN")
                     
                     previous_parts_set = current_parts_set
-                    all_part_numbers.extend(part_numbers)
+                    all_url_paths.extend(url_paths)
                     successful_accounts.append(account_number)
-                    self._log(f"Account {account_number}: Successfully extracted {len(part_numbers)} parts")
                 else:
                     failed_accounts.append(account_number)
-                    self._log(f"Account {account_number}: No parts extracted (possibly empty order history)", "WARN")
                     
             except Exception as e:
                 failed_accounts.append(account_number)
                 self._log(f"Account {account_number}: Failed with error: {e}", "ERROR")
         
-        self._log(f"\n--- Account Processing Summary ---")
-        self._log(f"Successful: {len(successful_accounts)}/{len(account_numbers)}")
-        self._log(f"Failed: {len(failed_accounts)}/{len(account_numbers)}")
-        if failed_accounts:
-            self._log(f"Failed accounts: {', '.join(failed_accounts)}")
-        
-        if not all_part_numbers:
+        if not all_url_paths:
             self._log("No parts extracted from any account", "ERROR")
             return [], successful_accounts, failed_accounts
         
-        self._log(f"\nTotal parts extracted across all accounts: {len(all_part_numbers)}")
-        
-        frequent_parts = self._count_and_filter_parts(all_part_numbers)
+        frequent_parts = self._count_and_filter_parts(all_url_paths)
         sorted_parts = sorted(frequent_parts.items(), key=lambda x: x[1], reverse=True)
         
-        self._log(f"\nAnalysis complete: Found {len(sorted_parts)} parts ordered {self.min_order_count}+ times")
         return sorted_parts, successful_accounts, failed_accounts
     
-    # ==================== PART SCRAPING METHODS ====================
+    # ==================== PART SCRAPING METHODS (SELENIUM - SEQUENTIAL) ====================
     
-    def _scrape_mcmaster_part(self, part_number: str) -> Dict[str, Any]:
-        """Scrape McMaster website for part information."""
-        url = f"https://www.mcmaster.com/{part_number}/"
+    def _scrape_mcmaster_part(self, url_path: str) -> Dict[str, Any]:
+        """Scrape McMaster website for part information using Selenium."""
+        url = f"https://www.mcmaster.com/{url_path}/"
         try:
             self.driver.get(url)
             wait = WebDriverWait(self.driver, 5)
             
             current_url = self.driver.current_url.lower()
             if '/search/' in current_url or 'nav/action' in current_url:
-                self._log(f"Part {part_number} redirected to search page - not a valid part", "WARN")
-                return {'Part Number': part_number, 'Parent Description': 'Not Found', 'Suffix Description': 'Not Found', 'Image URL': 'Not Found', 'Status': 'Invalid part number (redirected to search)'}
+                return {
+                    'Part Number': url_path,
+                    'Parent Description': 'Not Found',
+                    'Suffix Description': 'Not Found',
+                    'Image URL': 'Not Found',
+                    'Status': 'Invalid part number (redirected to search)'
+                }
             
             page_source_lower = self.driver.page_source.lower()
             if 'no results' in page_source_lower or 'did not match any products' in page_source_lower:
-                self._log(f"Part {part_number} page shows no results", "WARN")
-                return {'Part Number': part_number, 'Parent Description': 'Not Found', 'Suffix Description': 'Not Found', 'Image URL': 'Not Found', 'Status': 'Invalid part number (no results)'}
+                return {
+                    'Part Number': url_path,
+                    'Parent Description': 'Not Found',
+                    'Suffix Description': 'Not Found',
+                    'Image URL': 'Not Found',
+                    'Status': 'Invalid part number (no results)'
+                }
             
+            # Extract parent description
             try:
-                parent_elem = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'h1._productDetailHeaderPrimary_1ijr6_17, h1[class*="productDetailHeaderPrimary"]')))
+                parent_elem = wait.until(EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    'h1._productDetailHeaderPrimary_1ijr6_17, h1[class*="productDetailHeaderPrimary"]'
+                )))
                 parent_description = parent_elem.text.strip()
             except:
                 parent_description = "Not Found"
+            
+            # Extract suffix description
             try:
-                suffix_elem = self.driver.find_element(By.CSS_SELECTOR, 'h3._productDetailHeaderSecondary_1ijr6_31, h3[class*="productDetailHeaderSecondary"]')
+                suffix_elem = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    'h3._productDetailHeaderSecondary_1ijr6_31, h3[class*="productDetailHeaderSecondary"]'
+                )
                 suffix_description = suffix_elem.text.strip()
             except:
                 suffix_description = "Not Found"
+            
+            # Extract image URL
             image_url = "Not Found"
             try:
-                selectors_to_try = ['img[class*="printProductImage"]', 'div[class*="ImageContainer"] img', 'div[class*="imageContainer"] img', 'img._img_j8npf_109', 'img[class*="_img_"]']
+                selectors_to_try = [
+                    'img[class*="printProductImage"]',
+                    'div[class*="ImageContainer"] img',
+                    'div[class*="imageContainer"] img',
+                    'img._img_j8npf_109',
+                    'img[class*="_img_"]'
+                ]
                 img_elem = None
                 for selector in selectors_to_try:
                     try:
@@ -880,9 +910,13 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                             break
                     except:
                         continue
+                
                 if not img_elem:
                     raise Exception("No image element found")
+                
                 image_url = img_elem.get_attribute('src')
+                
+                # Try to get higher resolution from srcset
                 try:
                     srcset = img_elem.get_attribute('srcset')
                     if srcset:
@@ -897,24 +931,38 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                                 image_url = high_res_url
                 except:
                     pass
+                
                 if image_url and not image_url.startswith('http'):
                     image_url = f"https://www.mcmaster.com{image_url}"
             except Exception as e:
-                self._log(f"Could not find product image: {e}", "WARN")
                 image_url = "Not Found"
             
             if parent_description == "Not Found" and suffix_description == "Not Found":
                 status = "Part not found or page structure changed"
             else:
                 status = "Success"
-            return {'Part Number': part_number, 'Parent Description': parent_description, 'Suffix Description': suffix_description, 'Image URL': image_url if image_url != "Not Found" else "Not Found", 'Status': status}
+            
+            return {
+                'Part Number': url_path,
+                'Parent Description': parent_description,
+                'Suffix Description': suffix_description,
+                'Image URL': image_url,
+                'Status': status
+            }
+            
         except Exception as e:
-            self._log(f"Error scraping part {part_number}: {e}", "ERROR")
-            return {'Part Number': part_number, 'Parent Description': 'Error', 'Suffix Description': 'Error', 'Image URL': 'Error', 'Status': f'Failed: {str(e)}'}
+            self._log(f"Error scraping part {url_path}: {e}", "ERROR")
+            return {
+                'Part Number': url_path,
+                'Parent Description': 'Error',
+                'Suffix Description': 'Error',
+                'Image URL': 'Error',
+                'Status': f'Failed: {str(e)}'
+            }
     
-    def _scrape_mcmaster_part_with_retry(self, part_number: str) -> Dict[str, Any]:
-        """Scrape McMaster website for part information with one retry on failure."""
-        scrape_data = self._scrape_mcmaster_part(part_number)
+    def _scrape_mcmaster_part_with_retry(self, url_path: str) -> Dict[str, Any]:
+        """Scrape McMaster website with one retry on failure."""
+        scrape_data = self._scrape_mcmaster_part(url_path)
         
         has_failure = (
             scrape_data['Parent Description'] in ['Not Found', 'Error'] or
@@ -923,16 +971,16 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         )
         
         if has_failure:
-            self._log(f"First scrape attempt had failures for {part_number}, retrying...", "WARN")
+            self._log(f"First scrape attempt had failures for {url_path}, retrying...", "WARN")
             time.sleep(0.5)
-            scrape_data = self._scrape_mcmaster_part(part_number)
+            scrape_data = self._scrape_mcmaster_part(url_path)
             
             if scrape_data['Status'] != 'Success':
-                self._log(f"Retry also failed for {part_number}", "WARN")
+                self._log(f"Retry also failed for {url_path}", "WARN")
         
         return scrape_data
     
-    def _download_image(self, image_url: str, part_number: str) -> Image.Image:
+    def _download_image(self, image_url: str, part_identifier: str) -> Optional[Image.Image]:
         """Download product image from URL."""
         if image_url == "Not Found" or image_url == "Error":
             return None
@@ -942,22 +990,24 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             img = Image.open(BytesIO(response.content))
             return img
         except Exception as e:
-            self._log(f"Error downloading image for {part_number}: {e}", "WARN")
+            self._log(f"Error downloading image for {part_identifier}: {e}", "WARN")
             return None
     
-    def _generate_qr_code(self, link):
-        """Generate QR code for the given link."""
+    # ==================== LABEL GENERATION METHODS (THREADED) ====================
+    
+    def _generate_qr_code(self, link: str) -> Image.Image:
+        """Generate QR code using thread-local session."""
         try:
+            session = self._get_thread_session()
             api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={link}"
-            response = requests.get(api_url, timeout=10, verify=False)
+            response = session.get(api_url, timeout=10, verify=False)
             response.raise_for_status()
             qr_img = Image.open(BytesIO(response.content))
             return qr_img
         except Exception as e:
-            self._log(f"Warning: Could not generate QR code: {e}", "WARN")
             return Image.new('RGB', (400, 400), 'white')
     
-    def _wrap_text(self, text, font, draw, max_width):
+    def _wrap_text(self, text: str, font, draw, max_width: int) -> List[str]:
         """Wrap text to fit within max_width."""
         words = text.split()
         lines = []
@@ -974,50 +1024,13 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             lines.append(' '.join(current_line))
         return lines if lines else [text]
     
-    # ==================== CSV EXPORT METHODS ====================
-    
-    def _generate_parts_csv(self, frequent_parts: List[Tuple[str, int]], scraped_data_cache: Dict, output_folder: Path, account_numbers: List[str]) -> str:
-        """Generate CSV file with all parts and their information."""
-        csv_filename = "order_history_scrape_parts_list.csv"
-        csv_path = output_folder / csv_filename
-        
-        self._log(f"Generating parts CSV: {csv_path}")
-        
-        rows = []
-        for part_num, count in sorted(frequent_parts, key=lambda x: x[0]):
-            cached = scraped_data_cache.get(part_num, {})
-            scrape_data = cached.get('scrape_data', {})
-            
-            row = {
-                'Part Number': part_num,
-                'Order Count': count,
-                'Parent Description': scrape_data.get('Parent Description', 'N/A'),
-                'Suffix Description': scrape_data.get('Suffix Description', 'N/A'),
-                'Scrape Status': scrape_data.get('Status', 'N/A'),
-                'Included in PDF': 'Yes' if (
-                    scrape_data.get('Status') == 'Success' and
-                    scrape_data.get('Parent Description') not in ['Not Found', 'Error'] and
-                    scrape_data.get('Image URL') not in ['Not Found', 'Error'] and
-                    cached.get('product_image') is not None
-                ) else 'No',
-                'Customer Reference': cached.get('customer_ref', '')
-            }
-            rows.append(row)
-        
-        df = pd.DataFrame(rows)
-        df.to_csv(csv_path, index=False, encoding='utf-8')
-        
-        self._log(f"CSV generated with {len(rows)} parts")
-        return str(csv_path)
-    
-    # ==================== LABEL GENERATION METHODS ====================
-    
-    def _generate_label_small(self, part_number, item_header, additional_info, product_image, labels_folder, filename_part_number=None, customer_ref=None):
-        """Generate small label (0.925 x 2.75 in), rotated 90 degrees for vertical sticker."""
-        file_part_number = filename_part_number or part_number
+    def _generate_label_small(self, display_part, url_path, item_header, additional_info, 
+                               product_image, labels_folder, filename_part_number=None, customer_ref=None):
+        """Generate small label (0.925 x 2.75 in), rotated 90 degrees."""
+        file_part_number = filename_part_number or display_part
         has_customer_ref = customer_ref is not None and customer_ref.strip() != ''
         
-        link = f"https://www.mcmaster.com/{part_number}/?mode=QR"
+        link = f"https://www.mcmaster.com/{url_path}/?mode=QR"
         qr_img = self._generate_qr_code(link)
         
         product_img = None
@@ -1031,8 +1044,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 else:
                     product_img = product_image.convert("RGB")
                 product_img.thumbnail((250, 250), Image.Resampling.LANCZOS)
-            except Exception as e:
-                self._log(f"Warning: Could not process image: {e}", "WARN")
+            except Exception:
                 product_img = None
         
         qr_size = 145
@@ -1053,12 +1065,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 header_font = ImageFont.truetype("arialbd.ttf", 28)
                 info_font = ImageFont.truetype("arial.ttf", 24)
                 part_font = ImageFont.truetype("arial.ttf", 24)
+                ref_font = None
         except:
             header_font = ImageFont.load_default()
             info_font = ImageFont.load_default()
             part_font = ImageFont.load_default()
-            if has_customer_ref:
-                ref_font = ImageFont.load_default()
+            ref_font = ImageFont.load_default() if has_customer_ref else None
         
         if product_img:
             img_x = 50
@@ -1091,12 +1103,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         text_y += 6 if has_customer_ref else 10
         
-        part_lines = self._wrap_text(part_number, part_font, draw, max_text_width)
+        part_lines = self._wrap_text(display_part, part_font, draw, max_text_width)
         for line in part_lines:
             draw.text((text_start_x, text_y), line, fill='black', font=part_font)
             text_y += part_line_height
         
-        if has_customer_ref:
+        if has_customer_ref and ref_font:
             text_y += 4
             ref_text = f"Your ref: {customer_ref}"
             ref_lines = self._wrap_text(ref_text, ref_font, draw, max_text_width)
@@ -1115,8 +1127,8 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                     label.paste(logo_img_resized, (logo_x, logo_y), logo_img_resized)
                 else:
                     label.paste(logo_img_resized, (logo_x, logo_y))
-            except Exception as e:
-                self._log(f"Error placing logo: {e}", "WARN")
+            except Exception:
+                pass
         
         qr_y = label_height - qr_size - 22
         label.paste(qr_img, (qr_x, qr_y))
@@ -1128,12 +1140,13 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         return filename
     
-    def _generate_label_medium(self, part_number, item_header, additional_info, product_image, labels_folder, filename_part_number=None, customer_ref=None):
-        """Generate medium label (3.75" wide x 1.5" tall), horizontal layout."""
-        file_part_number = filename_part_number or part_number
+    def _generate_label_medium(self, display_part, url_path, item_header, additional_info,
+                                product_image, labels_folder, filename_part_number=None, customer_ref=None):
+        """Generate medium label (3.75 x 1.5 in), horizontal layout."""
+        file_part_number = filename_part_number or display_part
         has_customer_ref = customer_ref is not None and customer_ref.strip() != ''
         
-        link = f"https://www.mcmaster.com/{part_number}/?mode=QR"
+        link = f"https://www.mcmaster.com/{url_path}/?mode=QR"
         qr_img = self._generate_qr_code(link)
         
         product_img = None
@@ -1147,8 +1160,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 else:
                     product_img = product_image.convert("RGB")
                 product_img.thumbnail((340, 340), Image.Resampling.LANCZOS)
-            except Exception as e:
-                self._log(f"Warning: Could not process image: {e}", "WARN")
+            except Exception:
                 product_img = None
         
         qr_size = 200
@@ -1169,12 +1181,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 header_font = ImageFont.truetype("arialbd.ttf", 40)
                 info_font = ImageFont.truetype("arial.ttf", 32)
                 part_font = ImageFont.truetype("arial.ttf", 32)
+                ref_font = None
         except:
             header_font = ImageFont.load_default()
             info_font = ImageFont.load_default()
             part_font = ImageFont.load_default()
-            if has_customer_ref:
-                ref_font = ImageFont.load_default()
+            ref_font = ImageFont.load_default() if has_customer_ref else None
         
         if product_img:
             img_x = 70
@@ -1207,12 +1219,12 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         text_y += 6 if has_customer_ref else 10
         
-        part_lines = self._wrap_text(part_number, part_font, draw, max_text_width)
+        part_lines = self._wrap_text(display_part, part_font, draw, max_text_width)
         for line in part_lines:
             draw.text((text_start_x, text_y), line, fill='black', font=part_font)
             text_y += part_line_height
         
-        if has_customer_ref:
+        if has_customer_ref and ref_font:
             text_y += 6
             ref_text = f"Your ref: {customer_ref}"
             ref_lines = self._wrap_text(ref_text, ref_font, draw, max_text_width)
@@ -1231,8 +1243,8 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                     label.paste(logo_img_resized, (logo_x, logo_y), logo_img_resized)
                 else:
                     label.paste(logo_img_resized, (logo_x, logo_y))
-            except Exception as e:
-                self._log(f"Error placing logo: {e}", "WARN")
+            except Exception:
+                pass
         
         qr_y = label_height - qr_size - 30
         label.paste(qr_img, (qr_x, qr_y))
@@ -1242,15 +1254,128 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         return filename
     
-    def _generate_label_for_size(self, size: str, part_number, item_header, additional_info, product_image, labels_folder, filename_part_number=None, customer_ref=None):
+    def _generate_label_for_size(self, size: str, display_part, url_path, item_header, additional_info,
+                                  product_image, labels_folder, filename_part_number=None, customer_ref=None):
         """Generate label for a specific size."""
         if size == "medium":
-            return self._generate_label_medium(part_number, item_header, additional_info, product_image, labels_folder, filename_part_number, customer_ref)
+            return self._generate_label_medium(display_part, url_path, item_header, additional_info,
+                                               product_image, labels_folder, filename_part_number, customer_ref)
         else:
-            return self._generate_label_small(part_number, item_header, additional_info, product_image, labels_folder, filename_part_number, customer_ref)
+            return self._generate_label_small(display_part, url_path, item_header, additional_info,
+                                              product_image, labels_folder, filename_part_number, customer_ref)
+    
+    def _create_single_label_task(self, size: str, url_path: str, cached_data: Dict, 
+                                   labels_folder: str) -> Dict[str, Any]:
+        """Worker function for threaded label generation."""
+        scrape_data = cached_data['scrape_data']
+        product_image = cached_data['product_image']
+        count = cached_data['count']
+        customer_ref = cached_data['customer_ref']
+        part_info = cached_data['part_info']
+        display_part = part_info['display_part']
+        
+        scrape_fully_successful = (
+            scrape_data['Status'] == 'Success' and
+            scrape_data['Parent Description'] not in ['Not Found', 'Error'] and
+            scrape_data['Image URL'] not in ['Not Found', 'Error'] and
+            product_image is not None
+        )
+        
+        result = {
+            "display_part": display_part,
+            "url_path": url_path,
+            "order_count": count,
+            "label_file": None,
+            "status": "fail",
+            "include_in_pdf": False,
+            "customer_ref": customer_ref,
+            "is_component": part_info['is_component'],
+            "failure_reason": None,
+            "failure_details": None
+        }
+
+        try:
+            label_filename = self._generate_label_for_size(
+                size=size,
+                display_part=display_part,
+                url_path=url_path,
+                item_header=scrape_data['Parent Description'],
+                additional_info=scrape_data['Suffix Description'],
+                product_image=product_image,
+                labels_folder=labels_folder,
+                filename_part_number=display_part,
+                customer_ref=customer_ref
+            )
+            
+            include_in_pdf = scrape_fully_successful
+            
+            result["label_file"] = label_filename
+            result["status"] = "success" if include_in_pdf else "partial (excluded from PDF)"
+            result["include_in_pdf"] = include_in_pdf
+            
+            if not include_in_pdf:
+                result["failure_reason"] = "Scraping incomplete"
+                result["failure_details"] = {
+                    "parent_description": scrape_data['Parent Description'],
+                    "image_url": scrape_data['Image URL'],
+                    "image_downloaded": product_image is not None
+                }
+                    
+        except Exception as e:
+            result["status"] = f"failed: {str(e)}"
+            result["failure_reason"] = f"Label generation error: {str(e)}"
+            
+        return result
+    
+    # ==================== CSV EXPORT METHODS ====================
+    
+    def _generate_parts_csv(self, frequent_parts: List[Tuple[str, int]], scraped_data_cache: Dict,
+                            output_folder: Path, account_numbers: List[str]) -> str:
+        """Generate CSV file with all parts and their information."""
+        csv_filename = "order_history_scrape_parts_list.csv"
+        csv_path = output_folder / csv_filename
+        
+        self._log(f"Generating parts CSV: {csv_path}")
+        
+        rows = []
+        for url_path, count in sorted(frequent_parts, key=lambda x: x[0]):
+            cached = scraped_data_cache.get(url_path, {})
+            scrape_data = cached.get('scrape_data', {})
+            
+            part_info = self.part_info_map.get(url_path, {
+                'display_part': url_path,
+                'base_part': url_path,
+                'url_path': url_path,
+                'is_component': False
+            })
+            
+            row = {
+                'Part Number': part_info['display_part'],
+                'Base Part Number': part_info['base_part'],
+                'Order Count': count,
+                'Parent Description': scrape_data.get('Parent Description', 'N/A'),
+                'Suffix Description': scrape_data.get('Suffix Description', 'N/A'),
+                'Scrape Status': scrape_data.get('Status', 'N/A'),
+                'Included in PDF': 'Yes' if (
+                    scrape_data.get('Status') == 'Success' and
+                    scrape_data.get('Parent Description') not in ['Not Found', 'Error'] and
+                    scrape_data.get('Image URL') not in ['Not Found', 'Error'] and
+                    cached.get('product_image') is not None
+                ) else 'No',
+                'Customer Reference': cached.get('customer_ref', '')
+            }
+            rows.append(row)
+        
+        df = pd.DataFrame(rows)
+        df.to_csv(csv_path, index=False, encoding='utf-8')
+        
+        self._log(f"CSV generated with {len(rows)} parts")
+        return str(csv_path)
+    
+    # ==================== PDF GENERATION ====================
     
     def _generate_pdf(self, label_files: List[str], output_folder: Path, size: str):
-        """Generate PDF with all labels on sticker sheets for a specific size."""
+        """Generate PDF with all labels on sticker sheets."""
         config = LABEL_CONFIGS[size]
         dimension_str = config["pdf_dimension_str"]
         pdf_path = output_folder / f"labels_{dimension_str}.pdf"
@@ -1323,18 +1448,33 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             self._log("No labels to add to PDF", "WARN")
             return None
     
-    def _generate_labels_for_parts(self, frequent_parts: List[Tuple[str, int]], output_folder: Path, sizes_to_generate: List[str]):
-        """Generate labels for all parts for specified sizes."""
+    # ==================== MAIN LABEL GENERATION (HYBRID APPROACH) ====================
+    
+    def _generate_labels_for_parts(self, frequent_parts: List[Tuple[str, int]], output_folder: Path,
+                                    sizes_to_generate: List[str]):
+        """
+        Generate labels for all parts using hybrid approach:
+        - Phase 1: Sequential Selenium scraping (reliable, avoids WAF)
+        - Phase 2: Threaded label generation (fast QR codes + image processing)
+        """
         self._log("="*80)
-        self._log("PHASE 2: GENERATING LABELS")
+        self._log("PHASE 2: GENERATING LABELS (Hybrid: Sequential Scrape + Threaded Labels)")
         self._log(f"Sizes to generate: {', '.join(sizes_to_generate)}")
         if self.customer_refs:
             self._log(f"Customer references available for {len(self.customer_refs)} parts")
         self._log("="*80)
         
-        sorted_parts_alphabetical = sorted(frequent_parts, key=lambda x: x[0])
-        self._log(f"Sorted {len(sorted_parts_alphabetical)} parts alphabetically")
+        # Sort by display_part for alphabetical ordering
+        def get_sort_key(item):
+            url_path = item[0]
+            part_info = self.part_info_map.get(url_path, {'display_part': url_path})
+            return part_info['display_part']
         
+        sorted_parts_alphabetical = sorted(frequent_parts, key=get_sort_key)
+        self._log(f"Sorted {len(sorted_parts_alphabetical)} parts alphabetically by display part")
+        
+        # ========== PHASE 1: Sequential Selenium Scraping ==========
+        self._log("\n--- Phase 1: Sequential Selenium Scraping ---")
         self._log("Creating headless browser for part scraping...")
         self.driver = self._create_webdriver(headless=True)
         
@@ -1343,32 +1483,54 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         scrape_success = 0
         scrape_fail = 0
         
-        for i, (part_num, count) in enumerate(sorted_parts_alphabetical, 1):
-            self._log(f"Scraping {i}/{len(frequent_parts)}: {part_num}")
-            
-            scrape_data = self._scrape_mcmaster_part_with_retry(part_num)
-            
-            product_image = None
-            if scrape_data['Image URL'] not in ['Not Found', 'Error']:
-                product_image = self._download_image(scrape_data['Image URL'], part_num)
-            
-            scrape_results.append(scrape_data)
-            scraped_data_cache[part_num] = {
-                'scrape_data': scrape_data,
-                'product_image': product_image,
-                'count': count,
-                'customer_ref': self.customer_refs.get(part_num)
-            }
-            
-            if scrape_data['Status'] == 'Success':
-                scrape_success += 1
-            else:
-                scrape_fail += 1
-            
-            time.sleep(0.3)
+        try:
+            for i, (url_path, count) in enumerate(sorted_parts_alphabetical, 1):
+                part_info = self.part_info_map.get(url_path, {
+                    'display_part': url_path,
+                    'base_part': url_path,
+                    'url_path': url_path,
+                    'is_component': False
+                })
+                display_part = part_info['display_part']
+                
+                self._log(f"Scraping {i}/{len(frequent_parts)}: {url_path} (display: {display_part})")
+                
+                scrape_data = self._scrape_mcmaster_part_with_retry(url_path)
+                
+                product_image = None
+                if scrape_data['Image URL'] not in ['Not Found', 'Error']:
+                    product_image = self._download_image(scrape_data['Image URL'], url_path)
+                
+                scrape_results.append(scrape_data)
+                
+                customer_ref = self.customer_refs.get(display_part) or self.customer_refs.get(url_path)
+                
+                scraped_data_cache[url_path] = {
+                    'scrape_data': scrape_data,
+                    'product_image': product_image,
+                    'count': count,
+                    'customer_ref': customer_ref,
+                    'part_info': part_info
+                }
+                
+                if scrape_data['Status'] == 'Success':
+                    scrape_success += 1
+                else:
+                    scrape_fail += 1
+                
+                time.sleep(0.3)
+        finally:
+            if self.driver:
+                self.driver.quit()
+                self.driver = None
         
-        self.driver.quit()
         self._log(f"Scraping complete: {scrape_success} success, {scrape_fail} failed")
+        
+        # ========== PHASE 2: Threaded Label Generation ==========
+        self._log(f"\n--- Phase 2: Threaded Label Generation ({MAX_THREADS_LABELS} threads) ---")
+        
+        # Pre-load logo once (thread-safe since it's cached after first load)
+        self._load_mcmaster_logo()
         
         all_results = {}
         self.failed_parts = []
@@ -1384,75 +1546,48 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             label_success = 0
             label_fail = 0
             
-            for part_num, cached in scraped_data_cache.items():
-                scrape_data = cached['scrape_data']
-                product_image = cached['product_image']
-                count = cached['count']
-                customer_ref = cached['customer_ref']
+            # Use ThreadPoolExecutor for label generation
+            with ThreadPoolExecutor(max_workers=MAX_THREADS_LABELS) as executor:
+                futures = {
+                    executor.submit(
+                        self._create_single_label_task, 
+                        size, 
+                        url_path, 
+                        cached, 
+                        str(labels_folder)
+                    ): url_path 
+                    for url_path, cached in scraped_data_cache.items()
+                }
                 
-                scrape_fully_successful = (
-                    scrape_data['Status'] == 'Success' and
-                    scrape_data['Parent Description'] not in ['Not Found', 'Error'] and
-                    scrape_data['Image URL'] not in ['Not Found', 'Error'] and
-                    product_image is not None
-                )
-                
-                try:
-                    # Always use the original input part number for labels and QR codes
-                    label_filename = self._generate_label_for_size(
-                        size=size,
-                        part_number=part_num,  # Use original input part number
-                        item_header=scrape_data['Parent Description'],
-                        additional_info=scrape_data['Suffix Description'],
-                        product_image=product_image,
-                        labels_folder=str(labels_folder),
-                        filename_part_number=part_num,
-                        customer_ref=customer_ref
-                    )
-                    
-                    include_in_pdf = scrape_fully_successful
-                    
-                    label_results.append({
-                        "part_number": part_num,
-                        "order_count": count,
-                        "label_file": label_filename,
-                        "status": "success" if include_in_pdf else "partial (excluded from PDF)",
-                        "include_in_pdf": include_in_pdf,
-                        "customer_ref": customer_ref
-                    })
-                    
-                    if include_in_pdf:
-                        successful_label_files.append(label_filename)
-                        label_success += 1
-                    else:
-                        label_fail += 1
-                        if size == sizes_to_generate[0]:
-                            self.failed_parts.append({
-                                "part_number": part_num,
-                                "reason": "Scraping incomplete",
-                                "details": {
-                                    "parent_description": scrape_data['Parent Description'],
-                                    "image_url": scrape_data['Image URL'],
-                                    "image_downloaded": product_image is not None
-                                }
-                            })
+                for i, future in enumerate(as_completed(futures), 1):
+                    url_path = futures[future]
+                    try:
+                        result = future.result()
+                        label_results.append(result)
                         
-                except Exception as e:
-                    label_results.append({
-                        "part_number": part_num,
-                        "order_count": count,
-                        "label_file": None,
-                        "status": f"failed: {str(e)}",
-                        "include_in_pdf": False,
-                        "customer_ref": customer_ref
-                    })
-                    label_fail += 1
-                    if size == sizes_to_generate[0]:
-                        self.failed_parts.append({
-                            "part_number": part_num,
-                            "reason": f"Label generation error: {str(e)}",
-                            "details": None
-                        })
+                        if result["include_in_pdf"]:
+                            successful_label_files.append(result["label_file"])
+                            label_success += 1
+                        else:
+                            label_fail += 1
+                            # Only track failures once (on first size)
+                            if size == sizes_to_generate[0] and result.get("failure_reason"):
+                                self.failed_parts.append({
+                                    "display_part": result["display_part"],
+                                    "url_path": result["url_path"],
+                                    "reason": result["failure_reason"],
+                                    "details": result["failure_details"]
+                                })
+                        
+                        if i % 20 == 0 or i == len(futures):
+                            self._log(f"Generated {i}/{len(futures)} labels...")
+                            
+                    except Exception as exc:
+                        self._log(f"Label generation failed for {url_path}: {exc}", "ERROR")
+                        label_fail += 1
+            
+            # Sort label files alphabetically for consistent PDF ordering
+            successful_label_files.sort()
             
             pdf_path = None
             if successful_label_files:
@@ -1477,7 +1612,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             "scrape_failed": scrape_fail,
             "size_results": all_results,
             "failed_parts": self.failed_parts,
-            "scraped_data_cache": scraped_data_cache  # Return cache for CSV generation
+            "scraped_data_cache": scraped_data_cache
         }
     
     # ==================== MAIN RUN METHOD ====================
@@ -1520,6 +1655,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
         
         self.failed_parts = []
         self.customer_refs = {}
+        self.part_info_map = {}
         
         try:
             if use_excel_mode:
@@ -1584,7 +1720,6 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             
             label_data = self._generate_labels_for_parts(frequent_parts, output_folder, sizes_to_generate)
             
-            # Generate CSV for account mode
             csv_path = None
             if not use_excel_mode:
                 try:
@@ -1597,10 +1732,14 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
                 except Exception as e:
                     self._log(f"Error generating CSV: {e}", "ERROR")
             
+            component_count = sum(1 for url_path in dict(frequent_parts).keys() 
+                                  if self.part_info_map.get(url_path, {}).get('is_component', False))
+            
             result_data = {
                 "analysis_timestamp": datetime.now().isoformat(),
                 "label_sizes": sizes_to_generate,
                 "frequent_parts_count": len(frequent_parts),
+                "component_parts_count": component_count,
                 "frequent_parts": frequent_parts,
                 "scrape_successful": label_data["scrape_successful"],
                 "scrape_failed": label_data["scrape_failed"],
@@ -1627,7 +1766,7 @@ class CustomerPartsAnalyzerAndLabelGenerator(Tool):
             
             return {
                 "status": "success",
-                "message": f"Generated labels for {len(sizes_to_generate)} size(s): {total_in_pdf} in PDF per size, {total_excluded} excluded",
+                "message": f"Generated labels for {len(sizes_to_generate)} size(s): {total_in_pdf} in PDF per size, {total_excluded} excluded ({component_count} component parts)",
                 "data": result_data
             }
             
@@ -1680,6 +1819,9 @@ def print_results(result: Dict):
     print(f"Label Sizes: {', '.join(data.get('label_sizes', []))}")
     
     print(f"\nParts Processed: {data.get('frequent_parts_count')}")
+    component_count = data.get('component_parts_count', 0)
+    if component_count > 0:
+        print(f"Component Parts: {component_count}")
     print(f"Scraping - Success: {data.get('scrape_successful')}, Failed: {data.get('scrape_failed')}")
     
     print("\n" + "-"*80)
@@ -1698,7 +1840,8 @@ def print_results(result: Dict):
         print("FAILED PARTS SUMMARY")
         print("="*80)
         for fp in failed_parts:
-            print(f"  {fp['part_number']}: {fp['reason']}")
+            display = fp.get('display_part', fp.get('part_number', 'Unknown'))
+            print(f"  {display}: {fp['reason']}")
     
     print("\n" + "="*80)
 
@@ -1706,35 +1849,14 @@ def print_results(result: Dict):
 if __name__ == "__main__":
     tool = CustomerPartsAnalyzerAndLabelGenerator()
     
-    # # ==================== EXCEL MODE EXAMPLE ====================
-    # params = {
-    #     "excel_file_path": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\part_numbers.xlsx",
-    #     "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\Test Small",
-    #     "label_size": "small"  # options: 'small', 'medium', or 'all'
-    # }
-    
-    # print(f"Starting label generation from Excel file: {params['excel_file_path']}")
-    # print(f"Output folder: {params['output_folder']}")
-    # print(f"Label size: {params['label_size']}")
-    
     # ==================== ACCOUNT MODE EXAMPLE ====================
-    # Single account:
     params = {
         "account_number": "115328800",
         "lookback_days": 380,
         "min_order_count": 2,
-        "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\Test scrape",
+        "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Testing Files\Test Outputs\Scrape 6",
         "label_size": "medium"  
     }
-    
-    # Multiple accounts (comma-separated):
-    # params = {
-    #     "account_number": "115328800,395550300,376057700",
-    #     "lookback_days": 365,
-    #     "min_order_count": 5,
-    #     "output_folder": r"P:\Capacity Management\Management\Automation & Assistant Hub\QR Code\Pilot Labels\Combined Customer Labels",
-    #     "label_size": "medium"
-    # }
     
     print(f"Starting label generation for account(s): {params['account_number']}")
     print(f"Lookback period: {params['lookback_days']} days")
